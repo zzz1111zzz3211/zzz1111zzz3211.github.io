@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>奶蛙风塔 · 自动演示 9:16</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:#151318}
+  body{display:flex;align-items:center;justify-content:center;
+       font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+       -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+  #wrap{position:relative;transform-origin:center center;box-shadow:0 24px 80px rgba(0,0,0,.55)}
+  canvas{display:block;border-radius:6px}
+  #veil{position:absolute;inset:0;border-radius:6px;z-index:5;cursor:pointer;
+        background:linear-gradient(180deg,#FBF8F4 0%,#F0EAF7 55%,#E9E4F5 100%);
+        display:flex;flex-direction:column;align-items:center;justify-content:center;
+        transition:opacity .55s ease;color:#4B4560}
+  #veil .big{font-size:2.4rem;font-weight:800;letter-spacing:.14em;margin-bottom:.5rem}
+  #veil .sub{font-size:1rem;opacity:.72;margin-bottom:2.2rem;letter-spacing:.06em;text-align:center;line-height:1.8}
+  #veil .btn{padding:.85rem 2.6rem;border-radius:999px;background:#4B4560;color:#fff;
+             font-size:1.05rem;font-weight:700;letter-spacing:.16em;
+             box-shadow:0 10px 26px rgba(75,69,96,.28);animation:breathe 2.4s ease-in-out infinite}
+  @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.045)}}
+  #veil .tip{margin-top:1.8rem;font-size:.78rem;opacity:.5;line-height:1.9;text-align:center}
+  #veil .tip b{font-weight:700;opacity:.85}
+  #veil.gone{opacity:0;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="1080" height="1920"></canvas>
+  <div id="veil">
+    <div class="big">奶蛙风塔</div>
+    <div class="sub">强风把奶蛙吸在空中挤成一团<br>松手释放 · 同色入塔 · 中塔 5 侧塔 4</div>
+    <div class="btn">轻 触 开 始</div>
+    <div class="tip">轻触开始 · 松手即录 · 全程<b>纯画面无UI</b><br>R 立刻重开一局 · S 开关音效 · F 全屏 · 空格暂停</div>
+  </div>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+/* ============================================================
+   皮肤：三只奶蛙（已离线去绿幕 + 染色，见 _make_frogs.py）
+   换角色图：直接替换 img 指向的文件（透明底 PNG）
+   ============================================================ */
+const SKINS = [
+  { key:'blue',   name:'蓝', fill:'#5CB3F8', deep:'#2C86D6', img:'frog_blue.png'   },
+  { key:'red',    name:'红', fill:'#FF7B7B', deep:'#E2504F', img:'frog_red.png'    },
+  { key:'yellow', name:'黄', fill:'#FFC93C', deep:'#E9A516', img:'frog_yellow.png' },
+];
+(function loadSkins(){
+  for(const s of SKINS){
+    if(!s.img) continue;
+    const im = new Image();
+    im.onload = () => { s._img = im; };
+    im.onerror = () => { console.warn('[奶蛙风塔] 图片加载失败：' + s.img + '，回退为纯色'); };
+    im.src = s.img;
+  }
+})();
+
+/* ============================================================
+   大笑精灵图集：assets/laugh_{blue,red,yellow}.png
+   8x5 网格、每格 LAUGH_CELL，共 LAUGH_FRAMES 帧（离线抠绿幕+换色，见 _make_laugh.py）
+   顺序与 SKINS 一致：0蓝 1红 2黄。结算时按列颜色播放 -> 「所有奶蛙大笑」
+   ============================================================ */
+const LAUGH_CELL = 220, LAUGH_COLS = 8, LAUGH_FRAMES = 39, LAUGH_FPS = 20;
+const LAUGH_ONCE = 1.3;   // 入柱时单次大笑动画时长(s)
+const LAUGH = [
+  {img:'assets/laugh_blue.png'},
+  {img:'assets/laugh_red.png'},
+  {img:'assets/laugh_yellow.png'},
+];
+(function loadLaugh(){
+  for(const s of LAUGH){
+    const im = new Image();
+    im.onload = () => { s._img = im; };
+    im.onerror = () => { console.warn('[奶蛙风塔] 大笑图集加载失败：' + s.img); };
+    im.src = s.img;
+  }
+})();
+/* 结算大笑音频（已裁成 2.6s，见 _cut_laugh.py） */
+const LAUGH_SND = (typeof Audio !== 'undefined') ? new Audio('assets/laugh_cut.wav') : null;
+if(LAUGH_SND){ LAUGH_SND.preload = 'auto'; }
+const LAUGH_SND_SHORT = (typeof Audio !== 'undefined') ? new Audio('assets/laugh_short.wav') : null;
+if(LAUGH_SND_SHORT){ LAUGH_SND_SHORT.preload = 'auto'; }
+
+/* ============================================================
+   可调参数
+   ============================================================ */
+const CFG = {
+  gravity   : 1500,
+  size      : 96,      // 奶蛙绘制尺寸
+  radius    : 42,      // 碰撞半径
+  /* 发射：冲向接近屏幕顶部 */
+  vMin      : 1450,
+  vMax      : 1700,
+  angMin    : 76,      // 越大越垂直
+  angMax    : 87,
+  drag      : 0.55,
+  /* 风场：吸(悬浮互撞) -> 放(释放下落) 循环 */
+  captureY  : 680,     // 冲到此高度以上开始被风接住
+  hoverTop  : 160,     // 悬浮带上沿（贴近屏幕顶部）
+  hoverBot  : 410,     // 悬浮带下沿
+  hoverXMin : 100,     // 悬浮水平目标范围（决定掉出率；奶蛙碰撞半径大，柱沿外~45px仍会被唇板救回）
+  hoverXMax : 980,
+  springK   : 5.2,     // 垂直悬浮弹簧
+  dampY     : 2.8,     // 垂直阻尼
+  driftX    : 1.6,     // 水平回位弹簧
+  dampX     : 2.2,     // 水平阻尼
+  suckTime  : 3.2,     // 吸附期时长（含发射）
+  interval  : 0.47,    // 吸附期发射间隔（左右两炮同时）—— 顶飞会减少入柱，故加大发射数量
+  bounce    : 0.72,    // 悬浮互撞弹性
+  /* 自由飞行（上升/下降）互撞：实体不重合，把「慢的」高速顶飞出屏幕（吸附态不受影响） */
+  knockP    : 0.40,    // 相撞时触发顶飞的概率
+  knockSpd  : 2600,    // 顶飞速度：拉满力度，被撞块瞬间旋出屏幕
+};
+
+const W = 1080, H = 1920, TAU = Math.PI*2;
+const clamp = (v,a,b)=> v<a?a:(v>b?b:v);
+const lerp  = (a,b,t)=> a+(b-a)*t;
+const rand  = (a,b)=> a+Math.random()*(b-a);
+const eOutCubic = t=> 1-Math.pow(1-t,3);
+const eOutBack = t=>{ const c1=1.9,c3=c1+1; return 1+c3*Math.pow(t-1,3)+c1*Math.pow(t-1,2); };
+
+function rr(c,x,y,w,h,r){
+  r = Math.min(r,w/2,h/2);
+  c.beginPath(); c.moveTo(x+r,y);
+  c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r);
+  c.arcTo(x,y+h,x,y,r);     c.arcTo(x,y,x+w,y,r);
+  c.closePath();
+}
+
+/* ============================================================
+   音频（全合成，无外部资源）
+   ============================================================ */
+const SFX = {
+  ctx:null, master:null, on:true, voices:0, noise:null, windGain:null, lastBump:0,
+  init(){
+    if(this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.5;
+    this.master.connect(this.ctx.destination);
+    const len = Math.floor(this.ctx.sampleRate * 2);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i] = Math.random()*2-1;
+    this.noise = buf;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = 480; bp.Q.value = 0.65;
+    const g = this.ctx.createGain(); g.gain.value = 0;
+    src.connect(bp); bp.connect(g); g.connect(this.master);
+    src.start();
+    this.windGain = g;
+  },
+  tone(f1,f2,dur,type,vol,delay){
+    if(!this.on || !this.ctx || this.voices > 14) return;
+    const t0 = this.ctx.currentTime + (delay||0);
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(f1,t0);
+    if(f2 && f2 !== f1) o.frequency.exponentialRampToValueAtTime(Math.max(40,f2), t0+dur);
+    g.gain.setValueAtTime(0.0001,t0);
+    g.gain.exponentialRampToValueAtTime(vol||0.07, t0+0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t0); o.stop(t0+dur+0.02);
+    this.voices++; o.onended = ()=> this.voices--;
+  },
+  burst(dur,freq,vol,q){
+    if(!this.on || !this.ctx) return;
+    const t0 = this.ctx.currentTime;
+    const s = this.ctx.createBufferSource(); s.buffer = this.noise;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.setValueAtTime(freq,t0);
+    bp.frequency.exponentialRampToValueAtTime(freq*0.35, t0+dur);
+    bp.Q.value = q || 1.2;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001,t0);
+    g.gain.exponentialRampToValueAtTime(vol||0.05, t0+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001,t0+dur);
+    s.connect(bp); bp.connect(g); g.connect(this.master);
+    s.start(t0); s.stop(t0+dur+0.02);
+  },
+  launch(){ this.burst(0.18, 1500, 0.06, 0.9); this.tone(200,420,0.14,'sawtooth',0.022,0); },
+  bump(strength){
+    const now = performance.now();
+    if(now - this.lastBump < 90) return;
+    this.lastBump = now;
+    const v = clamp(strength/900, 0.2, 1);
+    this.tone(rand(480,640), rand(300,380), 0.09, 'sine', 0.02+0.045*v, 0);
+  },
+  suck(){ this.tone(180, 760, 0.6, 'sine', 0.05, 0); this.burst(0.7, 900, 0.05, 0.6); },
+  release(){ this.tone(900, 160, 0.45, 'sawtooth', 0.045, 0); this.burst(0.5, 500, 0.07, 0.5); },
+  good(n){ const b = 620 * Math.pow(1.06, clamp(n,0,5));
+           this.tone(b, b*1.5, 0.17, 'sine', 0.075, 0);
+           this.tone(b*2, b*2.4, 0.13, 'sine', 0.03, 0.04); },
+  dud(){ this.tone(300,150,0.15,'sine',0.045,0); },
+  win(){ [523,659,784,1047,1319].forEach((f,i)=> this.tone(f,f,0.34,'sine',0.07,i*0.1));
+         this.burst(0.5, 2600, 0.05, 0.7); },
+  knock(){
+    const now = performance.now();
+    if(now - (this.lastKnock||0) < 70) return;   // 限流，避免顶飞音过密
+    this.lastKnock = now;
+    this.burst(0.14, 2200, 0.05, 2.2); this.tone(880, 300, 0.12, 'triangle', 0.03, 0);
+  },
+  laughStart(){
+    try{
+      if(!LAUGH_SND || !this.on) return;
+      LAUGH_SND.loop = true;               // 结束页循环大笑
+      LAUGH_SND.pause();
+      LAUGH_SND.currentTime = 0;
+      const pr = LAUGH_SND.play();
+      if(pr && pr.catch) pr.catch(()=>{});
+    }catch(e){}
+  },
+  laughStop(){
+    try{ if(LAUGH_SND){ LAUGH_SND.pause(); LAUGH_SND.currentTime = 0; } }catch(e){}
+  },
+  /* 入柱大笑：1.3s 短片断（与 LAUGH_ONCE 动画等长），cloneNode 允许连发重叠；
+     限流 + 随机变速，避免密集入柱叠成噪音墙 */
+  entryLaugh(){
+    try{
+      if(!LAUGH_SND_SHORT || !this.on) return;
+      const now = performance.now();
+      if(now - (this.lastEntry||0) < 400) return;   // 入柱笑声限流
+      this.lastEntry = now;
+      const s = LAUGH_SND_SHORT.cloneNode(true);
+      s.volume = 0.5;
+      s.playbackRate = 0.95 + Math.random()*0.2;
+      const pr = s.play();
+      if(pr && pr.catch) pr.catch(()=>{});
+    }catch(e){}
+  },
+  setWind(v){
+    if(!this.windGain) return;
+    const vol = this.on ? v*0.09 : 0;
+    this.windGain.gain.setTargetAtTime(vol, this.ctx.currentTime, 0.2);
+  }
+};
+
+/* ============================================================
+   粒子
+   ============================================================ */
+const FX = {
+  items:[],
+  burst(x,y,color,n,spd){
+    n = n||12; spd = spd||260;
+    for(let i=0;i<n;i++){
+      const a = rand(0,TAU), s = rand(spd*0.35,spd);
+      this.items.push({k:'dot',x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-60,
+        r:rand(5,13),life:rand(0.45,0.85),t:0,c:color});
+    }
+  },
+  ring(x,y,color,r0,r1,dur){
+    this.items.push({k:'ring',x,y,r0:r0||18,r1:r1||130,life:dur||0.5,t:0,c:color});
+  },
+  confetti(n){
+    for(let i=0;i<n;i++){
+      this.items.push({k:'cf', x:rand(0,W), y:rand(-400,-40),
+        vx:rand(-40,40), vy:rand(320,620), w:rand(9,18), h:rand(16,30),
+        rot:rand(0,TAU), spin:rand(-7,7), life:rand(2.2,3.4), t:0,
+        c:PAL_CF[Math.floor(Math.random()*PAL_CF.length)]});
+    }
+  },
+  update(dt){
+    for(let i=this.items.length-1;i>=0;i--){
+      const p = this.items[i];
+      p.t += dt;
+      if(p.t >= p.life){ this.items.splice(i,1); continue; }
+      if(p.k === 'dot'){
+        p.x += p.vx*dt; p.y += p.vy*dt; p.vy += 900*dt; p.vx *= 0.985;
+      }else if(p.k === 'cf'){
+        p.x += p.vx*dt + Math.sin(p.t*4)*22*dt;
+        p.y += p.vy*dt; p.rot += p.spin*dt;
+      }
+    }
+  },
+  draw(c){
+    for(const p of this.items){
+      const k = p.t/p.life, fade = 1-k;
+      c.globalAlpha = fade;
+      if(p.k === 'dot'){
+        c.fillStyle = p.c; c.beginPath(); c.arc(p.x,p.y,p.r*fade,0,TAU); c.fill();
+      }else if(p.k === 'cf'){
+        c.save(); c.translate(p.x,p.y); c.rotate(p.rot);
+        c.fillStyle = p.c; c.fillRect(-p.w/2,-p.h/2,p.w,p.h); c.restore();
+      }else{
+        c.strokeStyle = p.c; c.lineWidth = 8*fade+1;
+        c.beginPath(); c.arc(p.x,p.y,lerp(p.r0,p.r1,eOutCubic(k)),0,TAU); c.stroke();
+      }
+    }
+    c.globalAlpha = 1;
+  },
+  clear(){ this.items.length = 0; }
+};
+const PAL_CF = ['#5CB3F8','#FF7B7B','#FFC93C','#6FE3B4','#BFA2F0','#FFFFFF'];
+
+/* ============================================================
+   几何：柱子（中 5 格，两侧 4 格，底对齐地面）
+   ============================================================ */
+const SLOT   = 88;
+const COL_IW = 160, COL_WT = 17, COL_BT = 20;
+const GROUND = 1680;
+const INNER_BOT = GROUND - COL_BT;                 // 内腔底 1660
+const COLS_DEF = [ {cx:300, target:4}, {cx:540, target:5}, {cx:780, target:4} ];
+
+class Column{
+  constructor(i){
+    this.i = i; this.ci = i;
+    this.cx = COLS_DEF[i].cx;
+    this.target = COLS_DEF[i].target;
+    this.IH = this.target * SLOT;
+    this.y0 = INNER_BOT - this.IH;                 // 柱口 y（中柱更高）
+    this.stack = [];
+    this.press = 0; this.shake = 0; this.glow = 0; this.winPulse = 0;
+  }
+  get inner(){ return {x:this.cx-COL_IW/2, y:this.y0, w:COL_IW, h:this.IH}; }
+  walls(){
+    const L = {x:this.cx-COL_IW/2-COL_WT, y:this.y0, w:COL_WT, h:this.IH+COL_BT};
+    const R = {x:this.cx+COL_IW/2,        y:this.y0, w:COL_WT, h:this.IH+COL_BT};
+    const B = {x:this.cx-COL_IW/2-COL_WT, y:this.y0+this.IH, w:COL_IW+COL_WT*2, h:COL_BT};
+    return [L,R,B];
+  }
+  slotY(k){ return INNER_BOT - (k+0.5)*SLOT; }
+}
+
+/* 柱口唇板：把落在柱沿/柱间的奶蛙导向最近的柱口（下端落在内腔内侧） */
+const GUIDES = [
+  [196, 1238, 226, 1310],   // 左柱左唇
+  [404, 1238, 374, 1310],   // 左柱右唇
+  [436, 1150, 466, 1222],   // 中柱左唇
+  [644, 1150, 614, 1222],   // 中柱右唇
+  [676, 1238, 706, 1310],   // 右柱左唇
+  [884, 1238, 854, 1310],   // 右柱右唇
+];
+
+/* 圆-矩形碰撞（只滑不弹，防止高速弹飞） */
+function hitRect(b,R){
+  const nx = clamp(b.x, R.x, R.x+R.w), ny = clamp(b.y, R.y, R.y+R.h);
+  const dx = b.x-nx, dy = b.y-ny;
+  const d2 = dx*dx + dy*dy;
+  if(d2 > b.r*b.r) return false;
+  let d = Math.sqrt(d2), ux, uy;
+  if(d > 0.0001){ ux = dx/d; uy = dy/d; }
+  else{
+    const cx = R.x+R.w/2, cy = R.y+R.h/2;
+    if(Math.abs(b.x-cx)/R.w > Math.abs(b.y-cy)/R.h){ ux = b.x>cx?1:-1; uy = 0; }
+    else { ux = 0; uy = b.y>cy?1:-1; }
+    d = 0;
+  }
+  const pen = b.r - d;
+  b.x += ux*pen; b.y += uy*pen;
+  const vn = b.vx*ux + b.vy*uy;
+  if(vn < 0){
+    b.vx -= 1.10*vn*ux;
+    b.vy -= 1.10*vn*uy;
+    b.vx *= 0.90; b.vy *= 0.95;
+    b.spin = b.spin*0.5 + (b.vx*-uy + b.vy*ux)*0.012;
+    return true;
+  }
+  return false;
+}
+/* 圆-线段碰撞（唇板） */
+function hitSeg(b, x1,y1,x2,y2){
+  if(b.vy < 0) return false;
+  const dx = x2-x1, dy = y2-y1;
+  const L2 = dx*dx + dy*dy;
+  if(L2 < 1) return false;
+  let t = ((b.x-x1)*dx + (b.y-y1)*dy) / L2;
+  t = clamp(t, 0, 1);
+  const px = x1 + dx*t, py = y1 + dy*t;
+  const ddx = b.x-px, ddy = b.y-py;
+  const d = Math.sqrt(ddx*ddx + ddy*ddy);
+  if(d > b.r) return false;
+  const ux = d > 0.0001 ? ddx/d : 0, uy = d > 0.0001 ? ddy/d : -1;
+  b.x += ux*(b.r-d); b.y += uy*(b.r-d);
+  const vn = b.vx*ux + b.vy*uy;
+  if(vn < 0){
+    b.vx -= 1.14*vn*ux;
+    b.vy -= 1.14*vn*uy;
+    b.vx *= 0.95; b.vy *= 0.92;
+    b.spin += (b.vx*-uy + b.vy*ux)*0.02;
+    return true;
+  }
+  return false;
+}
+
+/* ============================================================
+   主游戏
+   ============================================================ */
+const GAME = {
+  cols:[], blocks:[], launchers:[],
+  state:'play',            // play | win
+  phase:'suck',            // suck（吸附互撞）| drop（释放下落）
+  t:0, match:1, score:0, suckT:0, dropT:0,
+  roundT:0.4, time:0,
+  winCol:null, winT:0,
+  windVis:1,
+  streamers:[],
+  stats:{shots:0, in:0, hit:0, miss:0, fall:[]},
+
+  init(){
+    this.cols = COLS_DEF.map((_,i) => new Column(i));
+    this.launchers = [
+      {x:118, y:1400, dir: 1, ang:80, aimAng:80, aimV:1500, recoil:0, flash:0},
+      {x:962, y:1400, dir:-1, ang:80, aimAng:80, aimV:1500, recoil:0, flash:0}
+    ];
+    for(let i=0;i<34;i++){
+      this.streamers.push({x:rand(60,W-60), y:rand(150,1150),
+        len:rand(110,260), spd:rand(700,1200), ph:rand(0,TAU), a:rand(0.25,0.7)});
+    }
+    this.newMatch(true);
+  },
+  newMatch(first){
+    this.state = 'play'; this.phase = 'suck';
+    this.t = 0; this.winT = 0; this.winCol = null; this.dropT = 0;
+    this.blocks.length = 0; FX.clear();
+    SFX.laughStop();                       // 切下一局，停掉上局笑声
+    for(const c of this.cols){ c.stack.length = 0; c.press = 0; c.shake = 0; c.glow = 0; c.winPulse = 0; }
+    this.roundT = first ? 0.4 : 0.55;
+    this.stats = {shots:0, in:0, hit:0, miss:0, fall:[]};
+    this.planNext();
+    SFX.suck();
+  },
+
+  /* 橡皮筋：按"进度(已填/目标数)"加权。
+     开局 16s 内压制最接近满的柱（吊住悬念），26s 后帮领先者收尾防止拖沓 */
+  pickColor(){
+    const prog = this.cols.map(c => c.stack.length / c.target);
+    const mn = Math.min.apply(null,prog), mx = Math.max.apply(null,prog);
+    const early = this.t < 22, urgent = this.t > 22, panic = this.t > 32;
+    const weights = prog.map(p => {
+      let base = 1 + (mx - p) * 2.4 - (p - mn) * 2.4;
+      if(early && p > 0.55) base *= 0.06;         // 开局保护：领先柱暂时喂不进，抬高低谷
+      else if(p === mx && urgent) base *= panic ? 7.0 : 2.4;
+      return clamp(base, 0.06, 6.0);
+    });
+    const sum = weights[0]+weights[1]+weights[2];
+    let r = Math.random()*sum;
+    for(let i=0;i<3;i++){ if(r < weights[i]) return i; r -= weights[i]; }
+    return 2;
+  },
+
+  planNext(){
+    for(const L of this.launchers){
+      L.aimAng = rand(CFG.angMin, CFG.angMax);
+      L.aimV   = rand(CFG.vMin, CFG.vMax);
+    }
+  },
+  /* 发射间隔按墙钟收紧：34/37/39s 三段加速，确保单局 ≤40s */
+  curInterval(){
+    let iv = CFG.interval;
+    if(this.t > 34) iv *= 0.58;
+    if(this.t > 37) iv *= 0.58;
+    if(this.t > 39) iv *= 0.55;
+    return iv;
+  },
+  /* 时间闸门：每座塔在墙钟不同阶段有最高可填数，从根上抬高低谷（防提前结束） */
+  colCap(col){
+    const t = this.t;
+    if(t < 22) return col.target <= 4 ? 2 : 3;
+    if(t < 30) return col.target <= 4 ? 3 : 4;
+    return col.target;
+  },
+  fire(){
+    for(const L of this.launchers){
+      const a = L.aimAng * Math.PI/180;
+      const v = L.aimV;
+      const mx = Math.cos(a)*54*L.dir, my = -Math.sin(a)*54;
+      L.ang = L.aimAng; L.recoil = 1; L.flash = 1;
+      const ci = this.pickColor();
+      const b = {
+        ci, x:L.x+mx, y:L.y+my, vx:Math.cos(a)*v*L.dir, vy:-Math.sin(a)*v,
+        rot:0, spin:rand(-4,4), r:CFG.radius,
+        hoverX:rand(CFG.hoverXMin, CFG.hoverXMax),
+        hoverY:rand(CFG.hoverTop, CFG.hoverBot),
+        phase:'fly', p:0, sc:1, alpha:1, seed:rand(0,TAU), sq:0, col:null,
+        life:0, caught:false, ko:false
+      };
+      this.blocks.push(b);
+      this.stats.shots++;
+      FX.burst(b.x, b.y, 'rgba(255,255,255,.9)', 5, 150);
+    }
+    SFX.launch();
+    this.planNext();
+  },
+
+  update(dt){
+    this.time += dt;
+    if(this.state === 'win'){ this.updateWin(dt); FX.update(dt); return; }
+
+    this.t += dt;                       // 墙钟：整局累计（吸附+释放都计），用于节奏阈值
+    if(this.phase === 'suck'){
+      this.suckT += dt;
+      this.roundT -= dt;
+      if(this.roundT <= 0 && this.suckT < CFG.suckTime - 0.5){
+        this.roundT = this.curInterval(); this.fire();
+      }
+      if(this.suckT >= CFG.suckTime){
+        this.phase = 'drop'; this.dropT = 0;
+        SFX.release();
+      }
+      this.windVis = lerp(this.windVis, 1, 1-Math.pow(0.05,dt));
+    }else{
+      this.dropT += dt;
+      this.windVis = lerp(this.windVis, 0.05, 1-Math.pow(0.01,dt));
+      const active = this.blocks.some(b => b.phase === 'fly' || b.phase === 'enter' || b.phase === 'dud');
+      if(!active && this.dropT > 1.25){
+        this.phase = 'suck'; this.suckT = 0; this.roundT = this.curInterval();
+        SFX.suck();
+      }
+    }
+    SFX.setWind(this.windVis);
+
+    for(const L of this.launchers){
+      L.ang = lerp(L.ang, L.aimAng, 1-Math.pow(0.02,dt));
+      L.recoil = Math.max(0, L.recoil - dt*6);
+      L.flash  = Math.max(0, L.flash  - dt*7);
+    }
+    /* 流线向上飘（吸附期强，释放期消失） */
+    for(const s of this.streamers){
+      s.y -= s.spd * (0.2 + this.windVis*0.95) * dt;
+      if(s.y < 30){ s.y = 1150 + 120; s.x = rand(60,W-60); }
+    }
+
+    this.updateBlocks(dt);
+    this.resolveFlightCollisions();           // 上升/下降自由飞行互撞（可顶飞）
+    if(this.phase === 'suck') this.resolveCollisions();
+
+    /* 硬上限：超过 40s 仍未分胜负，领先柱直接获胜并顶满，保证画面完整 */
+    if(this.state === 'play' && this.t > 40) this.forceFinish();
+
+    for(const c of this.cols){
+      c.press = lerp(c.press, 0, 1-Math.pow(0.0008,dt));
+      c.shake = lerp(c.shake, 0, 1-Math.pow(0.0005,dt));
+      c.glow  = Math.max(0, c.glow - dt*1.7);
+    }
+    FX.update(dt);
+  },
+
+  updateWin(dt){
+    this.winT += dt;
+    if(this.winCol) this.winCol.winPulse = 1 + Math.sin(this.winT*7)*0.06;
+    if(this.winT > 0.25 && !this._cf){ this._cf = true; FX.confetti(90); }
+    for(const b of this.blocks) if(b.phase === 'fly'){ b.alpha = Math.max(0, b.alpha - dt*2.4); }
+    /* 结束页：一直维持所有奶蛙大笑，不弹结算、不自动重开（按 R 手动下一局） */
+  },
+
+  updateBlocks(dt){
+    const g = CFG.gravity;
+    for(let i=this.blocks.length-1;i>=0;i--){
+      const b = this.blocks[i];
+      if(b.phase === 'fly'){
+        b.life += dt;
+        if(b.life > 14){ b.phase = 'dud'; b.p = 0; this.stats.miss++; }
+
+        /* ---- 被顶飞：高速旋出屏幕。航行期只受重力，风阻极小（保持冲力），
+               且不参与任何碰撞/入柱/边界（continue 在那些判定之前） ---- */
+        if(b.ko){
+          b.vy += g*dt;
+          b.vx *= (1 - CFG.drag*0.25*dt);
+          b.vy *= (1 - CFG.drag*0.08*dt);
+          b.x += b.vx*dt; b.y += b.vy*dt; b.rot += b.spin*dt;
+          if(b.x < -140 || b.x > W+140 || b.y < -200 || b.y > H+160){
+            this.blocks.splice(i,1); this.stats.fall.push(0);
+          }
+          continue;
+        }
+
+        if(this.phase === 'suck' && b.y < CFG.captureY){
+          /* ---- 被风吸住：弹簧悬浮 ---- */
+          b.caught = true;
+          b.vy += ((b.hoverY - b.y) * CFG.springK - g) * dt;
+          b.vy *= (1 - CFG.dampY*dt);
+          b.vx += ((b.hoverX - b.x) * CFG.driftX + Math.sin(this.time*1.3 + b.seed)*42) * dt;
+          b.vx *= (1 - CFG.dampX*dt);
+          b.spin = lerp(b.spin, Math.sin(this.time*2 + b.seed)*0.5, 1-Math.pow(0.2,dt));
+        }else{
+          /* ---- 自由飞行 / 释放下落 ----（重置 caught：下降期也参与互撞/顶飞） */
+          b.caught = false;
+          b.vy += g*dt;
+          b.vx *= (1 - CFG.drag*dt);
+          b.vy *= (1 - CFG.drag*0.12*dt);
+        }
+        b.x += b.vx*dt; b.y += b.vy*dt; b.rot += b.spin*dt;
+
+        /* 边界 */
+        if(b.x < 40+b.r){ b.x = 40+b.r; b.vx = Math.abs(b.vx)*0.5; }
+        if(b.x > W-40-b.r){ b.x = W-40-b.r; b.vx = -Math.abs(b.vx)*0.5; }
+        if(b.y < 60){ b.y = 60; b.vy = Math.abs(b.vy)*0.25; }
+
+        /* 入柱判定（各柱口高度不同） */
+        let entered = false;
+        for(const col of this.cols){
+          const inn = col.inner;
+          const pad = -10;
+          if(b.x > inn.x+pad && b.x < inn.x+inn.w-pad && b.y > inn.y-4 && b.vy > 0){
+            entered = true; this.stats.in++;
+            if(b.ci === col.ci && col.stack.length < col.target && col.stack.length < this.colCap(col)){
+              col.stack.push(b);
+              b.phase = 'enter'; b.p = 0; b.col = col;
+              b.tx = col.cx; b.ty = col.slotY(col.stack.length-1);
+              b.sx = b.x; b.sy = b.y; b.srot = b.rot;
+              this.stats.hit++; this.score++;
+              col.glow = 1; col.press = 1;
+              SFX.good(col.stack.length);
+              FX.ring(col.cx, b.y, SKINS[b.ci].deep, 16, 120, 0.45);
+              FX.burst(b.x, b.y, SKINS[b.ci].fill, 10, 240);
+            }else{
+              b.phase = 'dud'; b.p = 0;
+              this.stats.miss++;
+              col.shake = 1;
+              SFX.dud();
+              FX.burst(b.x, b.y, 'rgba(120,116,132,.75)', 9, 190);
+            }
+            break;
+          }
+        }
+        if(!entered){
+          if(b.vy > 0){
+            for(const seg of GUIDES) hitSeg(b, seg[0], seg[1], seg[2], seg[3]);
+            for(const col of this.cols){
+              for(const R of col.walls()) hitRect(b, R);
+            }
+          }
+          if(b.y > GROUND - 46){ b.phase = 'dud'; b.p = 0; this.stats.miss++; this.stats.fall.push(Math.round(b.x)); SFX.dud();
+            FX.burst(b.x, b.y, 'rgba(120,116,132,.6)', 7, 150); }
+        }
+      }
+      else if(b.phase === 'enter'){
+        b.p += dt;
+        const k = clamp(b.p/0.38,0,1), e = eOutBack(k);
+        b.x = lerp(b.sx, b.tx, e); b.y = lerp(b.sy, b.ty, e);
+        b.rot = lerp(b.srot, 0, eOutCubic(k));
+        if(k >= 1){
+          b.phase = 'settled'; b.x = b.tx; b.y = b.ty; b.rot = 0; b.sq = 0.3;
+          b.laughT = 0;                       // 落柱即触发一次大笑动画
+          SFX.entryLaugh();                   // 落柱笑声（1.3s，与动画等长，见 _cut_laugh_short.py）
+          b.col.press = 1;
+          if(b.col.stack.length >= b.col.target){ this.declareWin(b.col); }
+        }
+      }
+      else if(b.phase === 'dud'){
+        b.p += dt;
+        const k = clamp(b.p/0.5,0,1);
+        b.alpha = 1-k; b.sc = lerp(1,0.55,eOutCubic(k));
+        b.y += 70*dt; b.rot += b.spin*0.4*dt;
+        if(k >= 1) this.blocks.splice(i,1);
+      }
+      else if(b.phase === 'settled'){
+        b.sq *= Math.pow(0.02,dt);
+        if(b.laughT !== undefined) b.laughT += dt;   // 入柱大笑动画计时
+      }
+    }
+  },
+
+  /* 悬浮奶蛙互撞：位置分离 + 弹性交换 —— 挤来挤去换位置 */
+  resolveCollisions(){
+    const bs = this.blocks.filter(b => b.phase === 'fly' && b.caught && !b.ko);
+    for(let i=0;i<bs.length;i++) for(let j=i+1;j<bs.length;j++){
+      const A = bs[i], B = bs[j];
+      const dx = B.x-A.x, dy = B.y-A.y;
+      const d = Math.sqrt(dx*dx + dy*dy);
+      const min = A.r + B.r;
+      if(d > 0.001 && d < min){
+        const nx = dx/d, ny = dy/d;
+        const push = (min-d)/2;
+        A.x -= nx*push; A.y -= ny*push;
+        B.x += nx*push; B.y += ny*push;
+        const vn = (B.vx-A.vx)*nx + (B.vy-A.vy)*ny;
+        if(vn < 0){
+          const imp = -(1+CFG.bounce)*vn/2;
+          A.vx -= imp*nx; A.vy -= imp*ny;
+          B.vx += imp*nx; B.vy += imp*ny;
+          if(-vn > 130) SFX.bump(-vn);
+        }
+      }
+    }
+  },
+
+  /* 自由飞行（上升/下降）互撞：实体永不重合；把「慢的」高速顶飞出屏幕。
+     吸附态(caught)不在此列 —— 它们由 resolveCollisions 处理，不受影响。
+     已顶飞的(ko)也不在此列 —— 飞出去期间关闭碰撞，直接穿场而过。
+     注意：释放下落时 b.caught 已被重置为 false，故下降期也会互撞顶飞。 */
+  resolveFlightCollisions(){
+    const bs = this.blocks.filter(b => b.phase === 'fly' && !b.caught && !b.ko);
+    for(let i=0;i<bs.length;i++) for(let j=i+1;j<bs.length;j++){
+      const A = bs[i], B = bs[j];
+      const dx = B.x-A.x, dy = B.y-A.y;
+      const d = Math.sqrt(dx*dx + dy*dy);
+      const min = A.r + B.r;
+      if(d > 0.001 && d < min){
+        const nx = dx/d, ny = dy/d;
+        const push = (min-d)/2;
+        A.x -= nx*push; A.y -= ny*push;      // 实体分离：绝不重合
+        B.x += nx*push; B.y += ny*push;
+        const sA = Math.hypot(A.vx,A.vy), sB = Math.hypot(B.vx,B.vy);
+        const slow = sA<=sB ? A : B, fast = sA<=sB ? B : A;
+        const kx = slow.x-fast.x, ky = slow.y-fast.y;
+        const kd = Math.hypot(kx,ky) || 1;
+        const ux = kx/kd, uy = ky/kd;         // fast -> slow 的撞击方向
+        if(Math.random() < CFG.knockP){
+          /* 把慢的高速顶飞出屏幕：力度拉满 + 高频旋转 + 飞出期间关闭碰撞 */
+          slow.ko = true;
+          slow.caught = false;               // 防御：即便吸附态被顶飞也立即脱离风场
+          slow.vx = ux*CFG.knockSpd + fast.vx*0.15;
+          slow.vy = uy*CFG.knockSpd + fast.vy*0.15 - 520;   // 偏上，便于飞出顶部
+          slow.spin = (Math.random()<0.5?-1:1) * rand(16,26);   // 高频旋转（约2.5~4圈/s）
+          this.stats.miss++;
+          this.stats.knock = (this.stats.knock||0) + 1;
+          FX.burst(slow.x, slow.y, 'rgba(255,255,255,.95)', 16, 420);
+          SFX.knock();
+        }else{
+          /* 少数情况轻弹：交换法向分量，不顶飞 */
+          const vn = (B.vx-A.vx)*nx + (B.vy-A.vy)*ny;
+          if(vn < 0){
+            const imp = -(1+0.3)*vn/2;
+            A.vx -= imp*nx; A.vy -= imp*ny;
+            B.vx += imp*nx; B.vy += imp*ny;
+          }
+        }
+      }
+    }
+  },
+
+  declareWin(col){
+    this.state = 'win'; this.winCol = col; this.winT = 0;
+    col.winPulse = 1;
+    SFX.laughStart(); SFX.setWind(0);   // 结算：所有奶蛙大笑（见 _cut_laugh.py）
+  },
+
+  /* 兜底：把进度最高的塔顶满并判胜，避免空塔收场 */
+  forceFinish(){
+    let best = this.cols[0];
+    for(const c of this.cols){
+      if(c.stack.length / c.target > best.stack.length / best.target) best = c;
+    }
+    while(best.stack.length < best.target){
+      const k = best.stack.length;
+      best.stack.push({ci:best.ci, x:best.cx, y:best.slotY(k), rot:0, sq:0,
+                       phase:'settled', col:best});
+      this.score++;
+    }
+    this.declareWin(best);
+  },
+
+  /* ================= 绘制 ================= */
+  draw(c){
+    this.drawWind(c);
+    this.drawGround(c);
+    for(const col of this.cols) this.drawColumn(c, col);
+    this.drawGuides(c);
+    this.drawLaunchers(c);
+    for(const b of this.blocks) if(b.phase !== 'settled') this.drawBlock(c,b);
+    FX.draw(c);
+    if(this.state === 'win') this.drawWin(c);
+  },
+
+  drawWind(c){
+    const top = 150, bot = 1150;
+    const g = c.createLinearGradient(0,bot,0,top);
+    g.addColorStop(0,'rgba(255,255,255,'+(0.02+this.windVis*0.13)+')');
+    g.addColorStop(1,'rgba(255,255,255,'+(0.02+this.windVis*0.22)+')');
+    c.fillStyle = g; c.fillRect(0,top,W,bot-top);
+    c.save();
+    c.lineCap = 'round';
+    for(const s of this.streamers){
+      const a = this.windVis * s.a;
+      if(a < 0.02) continue;
+      const off = Math.sin(this.time*2.2 + s.ph) * 24 * this.windVis;
+      const x = s.x + off;
+      c.strokeStyle = 'rgba(255,255,255,'+a+')';
+      c.lineWidth = 6;
+      c.beginPath();
+      c.moveTo(x + off*0.3, s.y);
+      c.lineTo(x, s.y - s.len);        /* 向上 */
+      c.stroke();
+    }
+    c.restore();
+  },
+
+  drawGround(c){
+    const g = c.createLinearGradient(0,GROUND-10,0,H);
+    g.addColorStop(0,'rgba(75,69,96,.10)');
+    g.addColorStop(1,'rgba(75,69,96,.02)');
+    c.fillStyle = g; c.fillRect(0,GROUND-10,W,H-GROUND+10);
+    c.strokeStyle = 'rgba(75,69,96,.14)'; c.lineWidth = 3;
+    c.beginPath(); c.moveTo(0,GROUND); c.lineTo(W,GROUND); c.stroke();
+  },
+
+  drawGuides(c){
+    c.save();
+    c.lineCap = 'round'; c.lineJoin = 'round';
+    for(const s of GUIDES){
+      c.strokeStyle = 'rgba(75,69,96,.18)'; c.lineWidth = 22;
+      c.beginPath(); c.moveTo(s[0], s[1]+7); c.lineTo(s[2], s[3]+7); c.stroke();
+      c.strokeStyle = '#6C6584'; c.lineWidth = 15;
+      c.beginPath(); c.moveTo(s[0], s[1]); c.lineTo(s[2], s[3]); c.stroke();
+      c.strokeStyle = 'rgba(255,255,255,.30)'; c.lineWidth = 4;
+      c.beginPath(); c.moveTo(s[0]+3, s[1]-4); c.lineTo(s[2]-3, s[3]-4); c.stroke();
+    }
+    c.restore();
+  },
+
+  drawColumn(c, col){
+    const sk = SKINS[col.ci];
+    const sh = col.shake * Math.sin(this.time*60) * 7;
+    const pu = col.winPulse;
+    c.save();
+    c.translate(col.cx + sh, 0);
+    if(pu) c.scale(pu, pu);
+    c.translate(-col.cx, 0);
+    const py = col.press * 9;
+    c.fillStyle = 'rgba(75,69,96,.07)';
+    rr(c, col.cx-COL_IW/2, col.y0+py, COL_IW, col.IH, 22); c.fill();
+    for(let k=col.stack.length;k<col.target;k++){
+      c.fillStyle = 'rgba(255,255,255,.55)';
+      rr(c, col.cx-CFG.size/2, col.slotY(k)+py-CFG.size/2, CFG.size, CFG.size, 20); c.fill();
+      c.strokeStyle = 'rgba(75,69,96,.10)'; c.lineWidth = 2.5;
+      rr(c, col.cx-CFG.size/2, col.slotY(k)+py-CFG.size/2, CFG.size, CFG.size, 20); c.stroke();
+    }
+    const winLaugh = (this.state === 'win') && !!LAUGH[col.ci]._img;
+    const lf = winLaugh ? (Math.floor(this.winT*LAUGH_FPS) % LAUGH_FRAMES) : 0;
+    for(let k=0;k<col.stack.length;k++){
+      const b = col.stack[k];
+      if(winLaugh){
+        /* 结束页：所有奶蛙大笑循环 */
+        this.drawLaughAt(c, col.ci, lf, col.cx, col.slotY(k)+py - b.sq*10, CFG.size*1.08, this.winT);
+      }else if(b.laughT !== undefined && b.laughT < LAUGH_ONCE && !!LAUGH[col.ci]._img){
+        /* 落柱：单次大笑动画 */
+        const f = Math.min(LAUGH_FRAMES-1, Math.floor(b.laughT*LAUGH_FPS));
+        this.drawLaughAt(c, col.ci, f, col.cx, col.slotY(k)+py - b.sq*10, CFG.size*1.08, b.laughT);
+      }else{
+        this.drawFrogAt(c, col.cx, col.slotY(k)+py - b.sq*10, b.rot, 1+b.sq*0.45, 1-b.sq*0.6, 1, b.ci);
+      }
+    }
+    c.fillStyle = sk.fill;
+    c.globalAlpha = 0.55 + col.glow*0.45;
+    rr(c, col.cx-COL_IW/2-COL_WT, col.y0+py-6, COL_WT, col.IH+COL_BT+6, 9); c.fill();
+    rr(c, col.cx+COL_IW/2,        col.y0+py-6, COL_WT, col.IH+COL_BT+6, 9); c.fill();
+    rr(c, col.cx-COL_IW/2-COL_WT, col.y0+col.IH+py, COL_IW+COL_WT*2, COL_BT, 10); c.fill();
+    c.globalAlpha = 1;
+    const gg = c.createLinearGradient(col.cx-COL_IW/2,0,col.cx+COL_IW/2,0);
+    gg.addColorStop(0,'rgba(255,255,255,.16)');
+    gg.addColorStop(0.35,'rgba(255,255,255,.02)');
+    gg.addColorStop(1,'rgba(255,255,255,.12)');
+    c.fillStyle = gg;
+    rr(c, col.cx-COL_IW/2, col.y0+py, COL_IW, col.IH, 22); c.fill();
+    /* 比分 n / target */
+    c.fillStyle = sk.deep;
+    c.font = '800 58px -apple-system,"PingFang SC",sans-serif';
+    c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(String(col.stack.length), col.cx, col.y0 - 56 + py);
+    c.font = '600 24px -apple-system,"PingFang SC",sans-serif';
+    c.fillStyle = 'rgba(75,69,96,.38)';
+    c.fillText('/ ' + col.target, col.cx + 74, col.y0 - 48 + py);
+    c.restore();
+  },
+
+  drawLaunchers(c){
+    for(const L of this.launchers){
+      const a = L.ang * Math.PI/180;
+      const dx = Math.cos(a)*L.dir, dy = -Math.sin(a);
+      const rec = L.recoil * 20;
+      c.save();
+      c.translate(L.x - dx*rec, L.y - dy*rec);
+      c.rotate(Math.atan2(dy,dx));
+      c.fillStyle = '#5A5470';
+      c.shadowColor = 'rgba(75,69,96,.25)'; c.shadowBlur = 18; c.shadowOffsetY = 8;
+      rr(c, 0, -19, 96, 38, 19); c.fill();
+      c.shadowBlur = 0;
+      c.fillStyle = 'rgba(255,255,255,.18)';
+      rr(c, 10, -13, 66, 12, 6); c.fill();
+      if(L.flash > 0){
+        c.globalAlpha = L.flash;
+        c.fillStyle = '#FFE9A8';
+        c.beginPath(); c.arc(96, 0, 22+L.flash*26, 0, TAU); c.fill();
+        c.globalAlpha = 1;
+      }
+      c.restore();
+      c.fillStyle = '#4B4560';
+      c.shadowColor = 'rgba(75,69,96,.3)'; c.shadowBlur = 20; c.shadowOffsetY = 10;
+      rr(c, L.x-58, L.y-34, 116, 92, 26); c.fill();
+      c.shadowBlur = 0;
+      c.fillStyle = 'rgba(255,255,255,.14)';
+      rr(c, L.x-46, L.y-26, 92, 26, 13); c.fill();
+    }
+  },
+
+  drawBlock(c,b){
+    const wob = (b.caught && this.phase === 'suck') ? Math.sin(this.time*3 + b.seed)*0.06 : 0;
+    this.drawFrogAt(c, b.x, b.y, b.rot + wob, b.sc, b.sc, b.alpha, b.ci);
+  },
+  /* 从大笑图集取第 frame 帧绘制（已按列颜色离线换色），带轻微上下颠；bt 为颠动时序 */
+  drawLaughAt(c, ci, frame, x, y, size, bt){
+    const sheet = LAUGH[ci] && LAUGH[ci]._img;
+    if(!sheet) return;
+    const sx = (frame % LAUGH_COLS) * LAUGH_CELL;
+    const sy = Math.floor(frame / LAUGH_COLS) * LAUGH_CELL;
+    const bob = Math.sin((bt||0)*14 + ci*1.3)*3;
+    c.save();
+    c.translate(x, y + bob);
+    c.drawImage(sheet, sx, sy, LAUGH_CELL, LAUGH_CELL, -size/2, -size/2, size, size);
+    c.restore();
+  },
+  drawFrogAt(c,x,y,rot,sx,sy,alpha,ci){
+    const sk = SKINS[ci], S = CFG.size;
+    c.save();
+    c.globalAlpha = alpha;
+    c.translate(x,y); c.rotate(rot); c.scale(sx,sy);
+    c.shadowColor = 'rgba(75,69,96,.26)'; c.shadowBlur = 18; c.shadowOffsetY = 8;
+    if(sk._img){
+      const im = sk._img;
+      const k = Math.min(S*1.14/im.width, S*1.14/im.height);
+      const w = im.width*k, h = im.height*k;
+      c.drawImage(im, -w/2, -h/2, w, h);
+    }else{
+      c.fillStyle = sk.fill;
+      rr(c,-S/2,-S/2,S,S,24); c.fill();
+      c.shadowBlur = 0;
+      c.fillStyle = 'rgba(255,255,255,.32)';
+      rr(c,-S/2+9,-S/2+9,S*0.38,S*0.22,10); c.fill();
+    }
+    c.restore();
+  },
+
+  drawWin(c){
+    const col = this.winCol; if(!col) return;
+    const sk = SKINS[col.ci];
+    const k = clamp(this.winT/0.4,0,1);
+    c.save();
+    c.globalAlpha = (0.5 + Math.sin(this.winT*5)*0.15) * k;
+    c.strokeStyle = sk.deep; c.lineWidth = 8;
+    rr(c, col.cx-COL_IW/2-26, col.y0-26, COL_IW+52, col.IH+COL_BT+40, 34); c.stroke();
+    c.restore();
+    /* 无结算弹窗：只靠高光描边 + 所有奶蛙大笑呈现胜者 */
+  }
+};
+
+/* ============================================================
+   背景 / 主循环
+   ============================================================ */
+let BG = null;
+function buildBG(){
+  BG = document.createElement('canvas');
+  BG.width = W; BG.height = H;
+  const g = BG.getContext('2d');
+  const grad = g.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,'#FDFBF7');
+  grad.addColorStop(0.45,'#F2EEF6');
+  grad.addColorStop(1,'#E8E2F3');
+  g.fillStyle = grad; g.fillRect(0,0,W,H);
+  const blobs = [[220,260,420,'#FFE7DE'],[880,760,520,'#E3F0FF'],[150,1420,440,'#EDE2FF'],[920,1700,420,'#E1F6EC']];
+  for(const b of blobs){
+    const rg = g.createRadialGradient(b[0],b[1],0,b[0],b[1],b[2]);
+    rg.addColorStop(0,b[3]); rg.addColorStop(1,'rgba(255,255,255,0)');
+    g.globalAlpha = 0.5; g.fillStyle = rg; g.fillRect(0,0,W,H);
+  }
+  g.globalAlpha = 1;
+}
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const wrap = document.getElementById('wrap');
+const UI = { hud:true, paused:false, running:false };
+
+let last = 0;
+function frame(now){
+  requestAnimationFrame(frame);
+  if(!UI.running) return;
+  const dt = Math.min(0.04, (now-last)/1000 || 0);
+  last = now;
+  if(UI.paused) return;
+  GAME.update(dt);
+  ctx.clearRect(0,0,W,H);
+  ctx.drawImage(BG,0,0);
+  GAME.draw(ctx);
+}
+
+function fit(){
+  const s = Math.min(window.innerWidth/W, window.innerHeight/H);
+  wrap.style.width = W+'px'; wrap.style.height = H+'px';
+  wrap.style.transform = 'scale('+s+')';
+}
+window.addEventListener('resize', fit);
+window.addEventListener('orientationchange', ()=> setTimeout(fit,120));
+
+const veil = document.getElementById('veil');
+function start(){
+  SFX.init();
+  if(SFX.ctx && SFX.ctx.state === 'suspended') SFX.ctx.resume();
+  veil.classList.add('gone');
+  UI.running = true; last = performance.now();
+}
+veil.addEventListener('click', start);
+veil.addEventListener('touchstart', e => { e.preventDefault(); start(); }, {passive:false});
+
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if(k === ' '){ e.preventDefault(); UI.paused = !UI.paused; }
+  else if(k === 's'){ SFX.on = !SFX.on; if(!SFX.on) SFX.setWind(0); }
+  else if(k === 'r'){ GAME.newMatch(false); }
+  else if(k === 'f'){
+    if(!document.fullscreenElement) document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
+    else document.exitFullscreen && document.exitFullscreen();
+  }
+});
+
+buildBG();
+GAME.init();
+fit();
+window.__GAME = GAME;
+window.__CFG = CFG;
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
